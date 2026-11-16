@@ -738,17 +738,28 @@ namespace platf::audio {
    * touch it after return, even on timeout, because the late callback is covered by
    * the operation's own reference.
    *
-   * @param handler Completion handler passed to ActivateAudioInterfaceAsync; its caller reference is consumed.
+   * When `wait_timed_out` is provided and the wait expires, the caller
+   * reference is NOT consumed: `*wait_timed_out` is set and ownership of
+   * that reference returns to the caller, which must keep the handler (and
+   * any activation blob the pending operation may still read) alive until
+   * the completion event fires, then release it.
+   *
+   * @param handler Completion handler passed to ActivateAudioInterfaceAsync; its caller reference is consumed unless the wait times out with `wait_timed_out` provided.
    * @param process_id Launched application PID being captured, used for diagnostics.
    * @param timeout_ms Wait deadline in milliseconds.
+   * @param wait_timed_out Optional out-flag set when the wait expires without consuming the caller reference.
    * @return Activated (not yet initialized) audio client, or nullptr on failure or timeout.
    */
-  audio_client_t collect_process_loopback_activation(process_loopback_completion_handler_t *handler, std::uint32_t process_id, DWORD timeout_ms = process_loopback_activation_timeout_ms) {
+  audio_client_t collect_process_loopback_activation(process_loopback_completion_handler_t *handler, std::uint32_t process_id, DWORD timeout_ms = process_loopback_activation_timeout_ms, bool *wait_timed_out = nullptr) {
     auto wait_result = WaitForSingleObject(handler->event_handle, timeout_ms);
     if (wait_result != WAIT_OBJECT_0) {
       BOOST_LOG(warning) << "Process loopback activation timed out for process ["sv << process_id
                          << "]: wait returned [0x"sv << util::hex(wait_result).to_string_view() << "] after timeout ["sv << timeout_ms
                          << " ms]; completion results unavailable"sv;
+      if (wait_timed_out) {
+        *wait_timed_out = true;
+        return nullptr;
+      }
       handler->Release();
       return nullptr;
     }
@@ -783,12 +794,15 @@ namespace platf::audio {
     // the stack-local params for the activation blob, the payload here is a
     // heap copy: init_process_loopback_activation_blob() allocates it with
     // CoTaskMemAlloc, so the prop_var_t destructor's PropVariantClear() always
-    // frees a heap address and can never free the stack. activation_prop stays
-    // alive until the wait below completes, while activation may still read the blob.
+    // frees a heap address and can never free the stack. The prop_var_t itself
+    // is heap-allocated too, because on a wait timeout the pending operation
+    // may still read the blob and call the handler: both must outlive this
+    // stack frame until the completion event fires (handled below).
     const auto params = make_process_loopback_activation_params(process_id);
-    prop_var_t activation_prop;
-    if (FAILED(init_process_loopback_activation_blob(activation_prop.prop, params))) {
+    auto *activation_prop = new prop_var_t();
+    if (FAILED(init_process_loopback_activation_blob(activation_prop->prop, params))) {
       BOOST_LOG(warning) << "Process loopback activation for process ["sv << process_id << "] could not allocate its activation blob"sv;
+      delete activation_prop;
       handler->Release();
       return nullptr;
     }
@@ -796,7 +810,7 @@ namespace platf::audio {
     auto status = ActivateAudioInterfaceAsync(
       VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
       IID_IAudioClient,
-      &activation_prop.prop,
+      &activation_prop->prop,
       handler,
       &operation
     );
@@ -805,11 +819,32 @@ namespace platf::audio {
     }
     if (FAILED(status)) {
       BOOST_LOG(warning) << "Process loopback activation failed to start for process ["sv << process_id << "]: ActivateAudioInterfaceAsync returned [0x"sv << util::hex(status).to_string_view() << ']';
+      delete activation_prop;
       handler->Release();
       return nullptr;
     }
-    // collect_process_loopback_activation() consumes the caller's handler reference on every path.
-    return collect_process_loopback_activation(handler, process_id);
+    // collect_process_loopback_activation() consumes the caller's handler
+    // reference unless the wait times out; on timeout keep the handler and
+    // activation blob alive on a detached waiter until the pending
+    // operation completes, instead of freeing state it may still read.
+    bool wait_timed_out = false;
+    auto client = collect_process_loopback_activation(handler, process_id, process_loopback_activation_timeout_ms, &wait_timed_out);
+    if (wait_timed_out) {
+      try {
+        std::thread {[handler, activation_prop]() {
+          WaitForSingleObject(handler->event_handle, INFINITE);
+          delete activation_prop;
+          handler->Release();
+        }}.detach();
+      } catch (...) {
+        // No waiter could be started; leak the handler and blob on purpose
+        // rather than free state the pending operation may still read.
+        BOOST_LOG(warning) << "Process loopback activation for process ["sv << process_id << "] timed out and its cleanup waiter could not start; leaking its activation state until process exit"sv;
+      }
+      return nullptr;
+    }
+    delete activation_prop;
+    return client;
   }
 #endif
 
@@ -843,6 +878,41 @@ namespace platf::audio {
     (void) process_id;
     (void) format;
     return nullptr;
+#endif
+  }
+
+  /**
+   * @brief Whether WASAPI process loopback can work on this build and OS.
+   *
+   * Process loopback needs the activation-parameter headers at compile time
+   * and Windows build 20348 or later (Windows 11 / Server 2022) at runtime.
+   * The version is read through `RtlGetVersion` so application-manifest
+   * version lies cannot mask the real build, and the result is cached.
+   *
+   * @return True when process-loopback activation is worth attempting.
+   */
+  [[nodiscard]] bool process_loopback_supported() {
+#if defined(SUNSHINE_HAS_AUDIOCLIENT_ACTIVATION_PARAMS) && defined(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK)
+    static const bool supported = []() {
+      using rtl_get_version_t = LONG(WINAPI *)(PRTL_OSVERSIONINFOW);
+      const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+      if (!ntdll) {
+        return false;
+      }
+      const auto rtl_get_version = reinterpret_cast<rtl_get_version_t>(GetProcAddress(ntdll, "RtlGetVersion"));
+      if (!rtl_get_version) {
+        return false;
+      }
+      RTL_OSVERSIONINFOW version {};
+      version.dwOSVersionInfoSize = sizeof(version);
+      if (rtl_get_version(&version) != 0) {
+        return false;
+      }
+      return version.dwMajorVersion > 10 || (version.dwMajorVersion == 10 && version.dwBuildNumber >= 20348);
+    }();
+    return supported;
+#else
+    return false;
 #endif
   }
 
@@ -1602,10 +1672,10 @@ namespace platf::audio {
     /**
      * @brief Whether the Windows backend can capture one launched process tree.
      *
-     * @return True; WASAPI process loopback is available on this backend.
+     * @return True only when this build and OS support WASAPI process loopback.
      */
     bool supports_process_capture() const override {
-      return true;
+      return process_loopback_supported();
     }
 
     /**
@@ -2752,12 +2822,18 @@ namespace platf::audio {
           handler->ActivateCompleted(nullptr);
           handler->Release();
         });
-        auto client = platf::audio::collect_process_loopback_activation(handler, 1234, kShortTimeoutMs);
+        bool wait_timed_out = false;
+        auto client = platf::audio::collect_process_loopback_activation(handler, 1234, kShortTimeoutMs, &wait_timed_out);
         const bool expired_before_completion = !completion_started.load(std::memory_order_acquire);
         SetEvent(gate);
         late_completion.join();
         CloseHandle(gate);
-        if (!expired_before_completion) {
+        if (wait_timed_out) {
+          // Model the production detached waiter releasing the retained
+          // caller reference once the late completion has run.
+          handler->Release();
+        }
+        if (!expired_before_completion || !wait_timed_out) {
           return kPhaseTimeoutOrdering;
         }
         if (client) {
@@ -2789,12 +2865,16 @@ namespace platf::audio {
             handler->ActivateCompleted(&operation);
             handler->Release();
           });
-          auto client = platf::audio::collect_process_loopback_activation(handler, 1234, kShortTimeoutMs);
+          bool wait_timed_out = false;
+          auto client = platf::audio::collect_process_loopback_activation(handler, 1234, kShortTimeoutMs, &wait_timed_out);
           const bool expired_before_completion = !completion_started.load(std::memory_order_acquire);
           SetEvent(gate);
           late_completion.join();
           CloseHandle(gate);
-          if (!expired_before_completion || client) {
+          if (wait_timed_out) {
+            handler->Release();
+          }
+          if (!expired_before_completion || !wait_timed_out || client) {
             return kPhaseLateSuccess;
           }
         }
@@ -2883,9 +2963,13 @@ namespace platf::audio {
             }
             handler->Release();
           });
-          auto client = platf::audio::collect_process_loopback_activation(handler, 1234, (i % 3 == 0) ? 0 : 1);
+          bool wait_timed_out = false;
+          auto client = platf::audio::collect_process_loopback_activation(handler, 1234, (i % 3 == 0) ? 0 : 1, &wait_timed_out);
           (void) client;  // Either outcome is legal under the race; only crash-freedom and lifetime are pinned.
           racer.join();
+          if (wait_timed_out) {
+            handler->Release();
+          }
         }
         if (fake_process_loopback_audio_client_t::live_count.load() != live_baseline) {
           return kPhaseLifetime;
@@ -3039,6 +3123,24 @@ namespace platf::audio {
       control.set_capture_target(set_intent, set_pid);
       control.clear_capture_target(clear_intent, clear_pid);
       return control.snapshot_capture_target().process_id;
+    }
+
+    /**
+     * @brief Record this process as the capture target, conditionally clear it, and report the stored identity.
+     *
+     * The current process PID is the deterministic verifiable target: its
+     * creation-time identity query always succeeds on the test host, so the
+     * recorded identity is nonzero until `on_capture_target_cleared()` runs.
+     *
+     * @param matching_clear Whether the clear uses the recorded intent and PID.
+     * @return Identity creation time stored on the control after the clear.
+     */
+    std::uint64_t identity_creation_time_after_conditional_clear(bool matching_clear) {
+      audio_control_t control;
+      const auto process_id = static_cast<std::uint32_t>(GetCurrentProcessId());
+      control.set_capture_target(audio_capture_intent_e::host_and_client, process_id);
+      control.clear_capture_target(audio_capture_intent_e::host_and_client, matching_clear ? process_id : process_id + 1);
+      return control.snapshot_capture_target().identity.creation_time;
     }
 
     /**

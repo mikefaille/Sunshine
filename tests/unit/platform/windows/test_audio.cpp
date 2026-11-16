@@ -67,6 +67,7 @@ namespace platf::audio::tests {
   std::uint32_t validated_capture_target_for_pid(std::uint32_t process_id);
   platf::audio_capture_intent_e intent_after_conditional_clear(platf::audio_capture_intent_e set_intent, std::uint32_t set_pid, platf::audio_capture_intent_e clear_intent, std::uint32_t clear_pid);
   std::uint32_t pid_after_conditional_clear(platf::audio_capture_intent_e set_intent, std::uint32_t set_pid, platf::audio_capture_intent_e clear_intent, std::uint32_t clear_pid);
+  std::uint64_t identity_creation_time_after_conditional_clear(bool matching_clear);
   bool assigned_sink_snapshot_is_stable();
   bool concurrent_control_access_is_consistent();
   bool find_device_matches(const std::wstring &match_name, IMMDeviceEnumerator *device_enum);
@@ -934,6 +935,13 @@ TEST(WindowsAudioTest, ConditionalClearPreservesMismatchedTarget) {
   EXPECT_EQ(platf::audio::tests::pid_after_conditional_clear(intent::host_and_client, 1234, intent::host_and_client, 0), 1234u);
   EXPECT_EQ(platf::audio::tests::pid_after_conditional_clear(intent::client_only, 0, intent::host_and_client, 1234), 0u);
   EXPECT_EQ(platf::audio::tests::intent_after_conditional_clear(intent::client_only, 0, intent::host_and_client, 1234), intent::client_only);
+}
+
+TEST(WindowsAudioTest, ConditionalClearResetsRecordedIdentity) {
+  // A matching clear runs on_capture_target_cleared(), resetting the paired
+  // creation-time identity; a mismatched clear must preserve it.
+  EXPECT_EQ(platf::audio::tests::identity_creation_time_after_conditional_clear(true), 0u);
+  EXPECT_NE(platf::audio::tests::identity_creation_time_after_conditional_clear(false), 0u);
 }
 
 TEST(WindowsAudioTest, AssignedSinkSnapshotStaysStableAcrossRewrite) {

@@ -7,6 +7,8 @@
 
 // standard includes
 #include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -25,6 +27,7 @@
   #include <Windows.h>
 #else
   // lib includes
+  #include <sys/wait.h>
   #include <unistd.h>
 #endif
 
@@ -698,6 +701,120 @@ TEST(ProcessTest, AppProcessIdTracksRealChildLifecycle) {
   EXPECT_GT(reader_calls.load(), 0u);
   EXPECT_FALSE(saw_unexpected_pid.load());
   EXPECT_EQ(target.app_process_id(), 0u);
+}
+
+/**
+ * @brief Verify the provider handed to audio capture tracks the launched app.
+ *
+ * `stream.cpp` passes `proc::app_process_id_provider(proc::proc)` to
+ * `audio::capture()`; this pins that the provider reports the live child
+ * PID and falls back to 0 after termination.
+ */
+TEST(ProcessTest, AppProcessIdProviderTracksRealChildLifecycle) {
+  boost::process::v1::environment env = boost::this_process::environment();
+  proc::ctx_t ctx {};
+  ctx.name = "Sleeper";
+  ctx.id = "7";
+  ctx.cmd = "sleep 30";
+  std::vector<proc::ctx_t> apps;
+  apps.push_back(std::move(ctx));
+  proc::proc_t target(std::move(env), std::move(apps));
+  const auto provider = proc::app_process_id_provider(target);
+
+  EXPECT_EQ(provider(), 0u);
+  auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(target.execute(7, launch_session), 0);
+  EXPECT_NE(provider(), 0u);
+  EXPECT_EQ(provider(), target.app_process_id());
+
+  target.terminate();
+  EXPECT_EQ(provider(), 0u);
+}
+
+/**
+ * @brief Verify running() cleanup after a relaunch never terminates the successor app.
+ */
+TEST(ProcessTest, RunningAfterRelaunchKeepsSuccessorAlive) {
+  boost::process::v1::environment env = boost::this_process::environment();
+  std::vector<proc::ctx_t> apps;
+  for (const auto id : {"7", "8"}) {
+    proc::ctx_t ctx {};
+    ctx.name = "Sleeper";
+    ctx.id = id;
+    ctx.cmd = "sleep 30";
+    apps.push_back(std::move(ctx));
+  }
+  proc::proc_t target(std::move(env), std::move(apps));
+  auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+
+  ASSERT_EQ(target.execute(7, launch_session), 0);
+  const auto first_pid = target.app_process_id();
+  ASSERT_NE(first_pid, 0u);
+  target.terminate();
+  EXPECT_EQ(target.running(), 0);
+
+  ASSERT_EQ(target.execute(8, launch_session), 0);
+  const auto successor_pid = target.app_process_id();
+  ASSERT_NE(successor_pid, 0u);
+  EXPECT_EQ(target.running(), 8);
+  EXPECT_EQ(target.running(), 8);
+  EXPECT_EQ(target.app_process_id(), successor_pid);
+
+  target.terminate();
+  EXPECT_EQ(target.running(), 0);
+}
+
+/**
+ * @brief Verify `running()` reaps exited children on the Desktop placebo poll.
+ *
+ * The placebo early return in `proc_t::running_impl()` must still run the
+ * POSIX `waitpid()` reaper; otherwise exited detached children linger as
+ * zombies for the whole Desktop session.
+ */
+TEST(ProcessTest, RunningReapsExitedChildOnPlaceboPoll) {
+  boost::process::v1::environment env = boost::this_process::environment();
+  proc::ctx_t ctx {};
+  ctx.name = "Desktop";
+  ctx.id = "42";
+  std::vector<proc::ctx_t> apps;
+  apps.push_back(std::move(ctx));
+  proc::proc_t target(std::move(env), std::move(apps));
+  auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
+  ASSERT_EQ(target.execute(42, launch_session), 0);
+  const auto cleanup = util::fail_guard([&target]() {
+    target.terminate();
+  });
+  ASSERT_EQ(target.running(), 42);
+
+  const pid_t child = fork();
+  ASSERT_NE(child, -1);
+  if (child == 0) {
+    _exit(0);
+  }
+  const auto reap_sacrificial = util::fail_guard([child]() {
+    // Test-local cleanup only; never masks the assertion below.
+    while (waitpid(child, nullptr, WNOHANG) > 0);
+  });
+
+  // Wait until the sacrificial child is an unreaped zombie, peeking with
+  // `waitid()`/`WNOWAIT` so the test itself never reaps it.
+  bool is_zombie = false;
+  for (int attempt = 0; attempt < 1000 && !is_zombie; ++attempt) {
+    siginfo_t info {};
+    if (waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == child) {
+      is_zombie = true;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_TRUE(is_zombie) << "sacrificial child did not become a zombie";
+
+  EXPECT_EQ(target.running(), 42);
+
+  siginfo_t info {};
+  errno = 0;
+  EXPECT_EQ(waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOHANG | WNOWAIT), -1);
+  EXPECT_EQ(errno, ECHILD) << "running() left the exited child as a zombie";
 }
 #endif
 

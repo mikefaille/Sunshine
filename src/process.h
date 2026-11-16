@@ -14,6 +14,7 @@
 
 // standard includes
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <unordered_map>
 
@@ -132,13 +133,19 @@ namespace proc {
     ~proc_t();
 
     /**
-     * @brief Return the configured applications.
+     * @brief Return a copy of the configured applications.
      *
-     * @return Immutable application list owned by the process manager.
+     * The copy is taken under the lifecycle mutex, so callers may iterate it
+     * without racing `update_apps_and_env()`.
+     *
+     * @return Copy of the application list owned by the process manager.
      */
-    const std::vector<ctx_t> &get_apps() const;
+    std::vector<ctx_t> get_apps() const;
     /**
      * @brief Return the configured applications.
+     *
+     * The mutable reference is for configuration reload and test setup only;
+     * callers must not hold it across lifecycle operations on other threads.
      *
      * @return Mutable application list owned by the process manager.
      */
@@ -199,11 +206,59 @@ namespace proc {
     int running_impl();
 
     /**
-     * @brief Implementation of terminate() used by public wrappers and internal callers.
+     * @brief State claimed atomically for one termination.
+     *
+     * `claim_termination_locked()` moves the process handles and copies the
+     * app/environment out under the lifecycle mutex; `finish_termination()`
+     * then performs every wait and undo command on this snapshot without
+     * holding the mutex, so a successor app launched in the meantime is
+     * never terminated or undone by mistake.
      */
-    void terminate_impl();
+    struct termination_snapshot_t {
+      boost::process::v1::child process;  ///< Launched root process claimed for termination.
+      boost::process::v1::group process_group;  ///< Process group claimed for termination.
+      ctx_t app;  ///< Copy of the app context whose prep commands are undone.
+      boost::process::v1::environment env;  ///< Copy of the environment for undo commands.
+      file_t pipe;  ///< Output pipe claimed with the app, closed after the undo commands.
+      std::size_t prep_completed {};  ///< Number of leading prep commands to undo, in reverse order.
+      std::chrono::seconds exit_timeout {};  ///< Graceful-exit timeout copied from the app context.
+      bool has_run {};  ///< Whether an app had been launched when the claim was taken.
+      std::string app_name;  ///< Name of the claimed app, for the stopped notification.
+    };
+
+    /**
+     * @brief Claim the current process state for termination.
+     *
+     * The caller must hold the lifecycle mutex. Claiming bumps
+     * `_lifecycle_generation`, moves `_process`/`_process_group`/`_pipe`
+     * out, and copies `_app`/`_env`, so the decision to clean up and the
+     * state being cleaned up are one atomic step.
+     *
+     * @return Snapshot carrying everything `finish_termination()` needs.
+     */
+    termination_snapshot_t claim_termination_locked();
+
+    /**
+     * @brief Terminate a claimed snapshot and run its undo commands.
+     *
+     * Runs without the lifecycle mutex: every wait operates on the snapshot,
+     * never on member state a successor launch may already own.
+     *
+     * @param snapshot State previously returned by `claim_termination_locked()`.
+     */
+    void finish_termination(termination_snapshot_t &&snapshot);
+
+    /**
+     * @brief Implementation of terminate() used by public wrappers and internal callers.
+     *
+     * @param expected_generation When set, terminate only when the lifecycle
+     * generation still matches, so stale cleanup cannot kill a successor app.
+     */
+    void terminate_impl(std::optional<std::uint64_t> expected_generation = std::nullopt);
 
     int _app_id;
+    std::uint64_t _lifecycle_generation {};  ///< Bumped on every launch claim and termination claim, guarded by the lifecycle mutex.
+    std::size_t _app_prep_completed {};  ///< Prep commands completed for `_app`, guarded by the lifecycle mutex.
 
     boost::process::v1::environment _env;
     std::vector<ctx_t> _apps;
@@ -276,4 +331,16 @@ namespace proc {
   void terminate_process_group(boost::process::v1::child &child_process, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
 
   extern proc_t proc;
+
+  /**
+   * @brief Build the capture process-id provider handed to audio capture.
+   *
+   * The returned callable reports `target.app_process_id()` at each call, so
+   * audio (re)initialization always sees the currently launched app. It
+   * borrows `target`; the caller keeps it alive for the provider's lifetime.
+   *
+   * @param target Process manager whose launched app PID is reported.
+   * @return Provider returning the launched root PID, or 0 when unavailable.
+   */
+  std::function<std::uint32_t()> app_process_id_provider(proc_t &target);
 }  // namespace proc

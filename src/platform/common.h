@@ -1036,6 +1036,28 @@ namespace platf {
     }
 
     /**
+     * @brief Copy the recorded capture target.
+     *
+     * Public read of the shared record so `audio::session_capture_target_t`
+     * can verify, after creating a microphone without holding the outer
+     * capture-target mutex, that the target it refreshed is still recorded.
+     *
+     * @return Intent and PID as one consistent snapshot.
+     */
+    [[nodiscard]] capture_target_record_t snapshot_capture_target_record() const {
+      return snapshot_recorded_capture_target();
+    }
+
+    /**
+     * @brief Copy the recorded capture sink.
+     *
+     * @return Recorded sink name, possibly empty when nothing was recorded.
+     */
+    [[nodiscard]] std::string snapshot_capture_sink_record() const {
+      return snapshot_recorded_sink();
+    }
+
+    /**
      * @brief Create a microphone capture stream for the requested layout.
      *
      * @param mapping Opus channel mapping table for the requested layout.

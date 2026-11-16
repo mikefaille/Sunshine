@@ -7,6 +7,7 @@
 #include "../tests_common.h"
 
 // standard includes
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -552,6 +553,7 @@ namespace {
       calls.emplace_back("set_capture_target");
       set_intent = intent;
       set_process_id = process_id;
+      record_capture_target(intent, process_id);
     }
 
     /**
@@ -578,6 +580,12 @@ namespace {
       mic_host_audio_enabled = host_audio_enabled;
       if (fail_microphone) {
         return nullptr;
+      }
+      if (retarget_once) {
+        // Model another session replacing the shared target while this
+        // microphone was being created without the outer mutex held.
+        retarget_once = false;
+        record_capture_target(set_intent, set_process_id + 1);
       }
       return std::make_unique<stub_mic_t>();
     }
@@ -609,6 +617,7 @@ namespace {
     int set_sink_status = 0;  ///< Status returned by set_sink().
     int capture_sink_status = 0;  ///< Status returned by capture_sink().
     bool fail_microphone = false;  ///< Whether microphone() returns nullptr.
+    bool retarget_once = false;  ///< Whether the next microphone() replaces the recorded target mid-creation.
     std::vector<std::string> calls;  ///< Recorded call sequence in invocation order.
     platf::audio_capture_intent_e set_intent = platf::audio_capture_intent_e::client_only;  ///< Intent from the last refresh.
     std::uint32_t set_process_id = 0;  ///< PID from the last refresh.
@@ -837,6 +846,29 @@ TEST(CaptureRefreshTest, MicrophoneFailureStillRecordsTarget) {
   // The failed refresh still owns a target, so scope exit must release it.
   EXPECT_EQ(control.clear_intent, platf::audio_capture_intent_e::host_and_client);
   EXPECT_EQ(control.clear_process_id, 1234u);
+}
+
+/**
+ * @brief A target replaced during microphone creation must discard that microphone and retry.
+ *
+ * Microphone creation no longer runs under the outer mutex, so the
+ * post-creation re-check is what preserves the refresh/microphone pairing.
+ */
+TEST(CaptureRefreshTest, RetargetDuringCreationDiscardsAndRetries) {
+  recording_audio_control_t control;
+  control.retarget_once = true;
+  std::mutex mutex;
+  const std::function<std::uint32_t()> provider = [] {
+    return 1234u;
+  };
+  session_capture_target_t target {control, platf::audio_capture_intent_e::host_and_client, mutex};
+
+  auto mic = target.create_microphone(true, provider, make_mic_params());
+
+  EXPECT_TRUE(static_cast<bool>(mic));
+  EXPECT_EQ(std::count(control.calls.begin(), control.calls.end(), "set_capture_target"), 2);
+  EXPECT_EQ(std::count(control.calls.begin(), control.calls.end(), "microphone"), 2);
+  EXPECT_EQ(control.snapshot_capture_target_record().process_id, 1234u);
 }
 
 /**

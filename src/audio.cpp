@@ -38,10 +38,11 @@ namespace audio {
    * @brief Serializes capture-target refresh, microphone creation, and target release across concurrent sessions.
    *
    * All capture() threads share one audio control. Each session's
-   * session_capture_target_t guard holds this mutex across every
-   * refresh/microphone pair (and across the exit clear), which keeps one
-   * session from resetting the shared target between another session's
-   * refresh and microphone creation.
+   * session_capture_target_t guard holds this mutex across the refresh,
+   * the post-creation re-check, and the exit clear, but never across
+   * microphone creation itself, which can wait on endpoint activation;
+   * the re-check keeps one session from keeping a microphone created
+   * after another session replaced the shared target.
    *
    * Lock order: this outer mutex is always taken before the backend-internal
    * `platf::audio_control_t::capture_state_mutex_`, acquired inside
@@ -220,15 +221,33 @@ namespace audio {
   ) {
     // Refresh the capture target before every microphone creation so a
     // process that appears or exits between reinitializations is reflected.
-    // The lock covers the refresh/microphone pair, and the refresh is
-    // recorded even when microphone creation fails so teardown still
-    // releases this session's target.
-    std::lock_guard lock {*mutex_};
-    const auto process_id = capture_process_id_provider ? capture_process_id_provider() : 0u;
-    process_id_ = should_capture_process_tree(intent_, process_capture_supported, process_id) ? process_id : 0u;
-    control_->set_capture_target(intent_, process_id_);
-    recorded_ = true;
-    return control_->microphone(mic_params);
+    // Only the refresh runs under the lock: microphone creation can wait
+    // seconds on endpoint activation, and holding the lock across it would
+    // stall every other session's teardown. The refresh is recorded even
+    // when microphone creation fails so teardown still releases this
+    // session's target. After creation the recorded target is re-checked
+    // under the lock; a microphone created while another session replaced
+    // the target is discarded and creation retries once with a fresh
+    // refresh, preserving the original refresh/microphone pairing.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const auto process_id = capture_process_id_provider ? capture_process_id_provider() : 0u;
+      {
+        std::lock_guard lock {*mutex_};
+        process_id_ = should_capture_process_tree(intent_, process_capture_supported, process_id) ? process_id : 0u;
+        control_->set_capture_target(intent_, process_id_);
+        recorded_ = true;
+      }
+      auto mic = control_->microphone(mic_params);
+      if (!process_capture_supported) {
+        return mic;
+      }
+      std::lock_guard lock {*mutex_};
+      if (control_->snapshot_capture_target_record().matches(intent_, process_id_)) {
+        return mic;
+      }
+      BOOST_LOG(info) << "Capture target changed during microphone creation; discarding and retrying"sv;
+    }
+    return nullptr;
   }
 
   /**

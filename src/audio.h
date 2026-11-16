@@ -315,9 +315,10 @@ namespace audio {
      *
      * The refresh always runs before microphone creation so a dropped refresh
      * is observable: set_capture_target() is called on every invocation,
-     * including reinitializations and microphone failures. The lock is held
-     * across the refresh/microphone pair so the shared target cannot change
-     * in between.
+     * including reinitializations and microphone failures. The lock covers
+     * only the refresh and the post-creation re-check, never microphone
+     * creation itself; when the recorded target changed during creation the
+     * microphone is discarded and creation retries once.
      *
      * @param process_capture_supported Whether the backend captures a process tree.
      * @param capture_process_id_provider Optional callable returning the launched application PID (0 for endpoint capture).

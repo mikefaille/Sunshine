@@ -352,8 +352,8 @@ TEST(AudioControlAdapterTest, LegacyBackendKeepsSwapBehavior) {
 TEST(AudioControlAdapterTest, DefaultCaptureTargetSetterIsNoOp) {
   legacy_audio_control_t control;
   EXPECT_FALSE(control.supports_process_capture());
-  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, 1234);
-  control.set_capture_target(platf::audio_capture_intent_e::client_only, 0);
+  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, platf::process_identity_t {1234, 0});
+  control.set_capture_target(platf::audio_capture_intent_e::client_only, platf::process_identity_t {0, 0});
   EXPECT_FALSE(control.set_sink_called);
 }
 
@@ -547,13 +547,14 @@ namespace {
     /**
      * @brief Record the refreshed capture target.
      * @param intent Capture intent resolved from the audio configuration.
-     * @param process_id Operating-system PID to capture, or 0 for endpoint capture.
+     * @param identity Operating-system identity to capture, or {0, 0} for endpoint capture.
      */
-    void set_capture_target(platf::audio_capture_intent_e intent, std::uint32_t process_id) override {
+    void set_capture_target(platf::audio_capture_intent_e intent, platf::process_identity_t identity) override {
       calls.emplace_back("set_capture_target");
       set_intent = intent;
-      set_process_id = process_id;
-      record_capture_target(intent, process_id);
+      set_process_id = identity.process_id;
+      set_creation_time = identity.creation_time;
+      record_capture_target(intent, identity.process_id);
     }
 
     /**
@@ -621,6 +622,7 @@ namespace {
     std::vector<std::string> calls;  ///< Recorded call sequence in invocation order.
     platf::audio_capture_intent_e set_intent = platf::audio_capture_intent_e::client_only;  ///< Intent from the last refresh.
     std::uint32_t set_process_id = 0;  ///< PID from the last refresh.
+    std::uint64_t set_creation_time = 0;  ///< Creation marker from the last refresh.
     platf::audio_capture_intent_e clear_intent = platf::audio_capture_intent_e::client_only;  ///< Intent from the last release.
     std::uint32_t clear_process_id = 0;  ///< PID from the last release.
     const std::uint8_t *mic_mapping = nullptr;  ///< Mapping from the last microphone() call.
@@ -758,18 +760,18 @@ TEST(CaptureSinkDispatchTest, SwapWithoutRestoreSkipsSinkCall) {
 }
 
 /**
- * @brief A provided PID must reach set_capture_target ahead of microphone creation.
+ * @brief A provided identity must reach set_capture_target ahead of microphone creation.
  *
  * Fail-without-fix: if the guard skips the refresh (or creates the microphone
  * first), the backend captures a stale target from a previous session instead
  * of the launched game, and the set-before-microphone ordering below breaks.
  */
-TEST(CaptureRefreshTest, ProviderPidIsRecordedBeforeMicrophone) {
+TEST(CaptureRefreshTest, ProviderIdentityIsRecordedBeforeMicrophone) {
   recording_audio_control_t control;
   std::mutex mutex;
   session_capture_target_t target {control, platf::audio_capture_intent_e::host_and_client, mutex};
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
 
   auto mic = target.create_microphone(true, provider, make_mic_params());
@@ -779,23 +781,49 @@ TEST(CaptureRefreshTest, ProviderPidIsRecordedBeforeMicrophone) {
   EXPECT_EQ(target.process_id(), 1234u);
   EXPECT_EQ(control.set_intent, platf::audio_capture_intent_e::host_and_client);
   EXPECT_EQ(control.set_process_id, 1234u);
+  EXPECT_EQ(control.set_creation_time, 91011u);
   EXPECT_LT(control.call_index("set_capture_target"), control.call_index("microphone"));
 }
 
 /**
- * @brief Endpoint capture must record PID 0 for every non-process case.
+ * @brief The handed-off creation marker must reach the backend verbatim.
+ *
+ * The marker is the backend's PID-reuse baseline: it is captured from the
+ * owned child handle under the process lifecycle lock, so the backend stores
+ * it without re-querying. Fail-without-fix: if the guard drops the marker
+ * (or passes a zeroed bundle), the backend records an unverifiable baseline
+ * and every process-capture session silently degrades to endpoint capture.
+ */
+TEST(CaptureRefreshTest, ProviderIdentityReachesBackendVerbatim) {
+  recording_audio_control_t control;
+  std::mutex mutex;
+  session_capture_target_t target {control, platf::audio_capture_intent_e::host_and_client, mutex};
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {4242u, 0xBEEFCAFEu};
+  };
+
+  auto mic = target.create_microphone(true, provider, make_mic_params());
+
+  ASSERT_TRUE(static_cast<bool>(mic));
+  EXPECT_EQ(control.set_process_id, 4242u);
+  EXPECT_EQ(control.set_creation_time, 0xBEEFCAFEu);
+}
+
+/**
+ * @brief Endpoint capture must record a zeroed identity for every non-process case.
  *
  * Fail-without-fix: if the guard records the raw provider PID without the
  * should_capture_process_tree() gate, a client-only or pinned session (or an
  * unsupported backend) captures the game process instead of the endpoint,
- * defeating silence or the configured sink pin.
+ * defeating silence or the configured sink pin. Gating the PID while leaking
+ * the marker would likewise name no process at all.
  */
 TEST(CaptureRefreshTest, EndpointCasesRecordZeroPid) {
   using intent = platf::audio_capture_intent_e;
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
-  const std::function<std::uint32_t()> empty_provider;
+  const std::function<platf::process_identity_t()> empty_provider;
 
   for (const auto &[case_intent, supported, case_provider] : {
          std::tuple {intent::host_and_client, true, empty_provider},
@@ -813,6 +841,7 @@ TEST(CaptureRefreshTest, EndpointCasesRecordZeroPid) {
     EXPECT_TRUE(target.recorded());
     EXPECT_EQ(target.process_id(), 0u);
     EXPECT_EQ(control.set_process_id, 0u);
+    EXPECT_EQ(control.set_creation_time, 0u);
     EXPECT_EQ(control.set_intent, case_intent);
     EXPECT_LT(control.call_index("set_capture_target"), control.call_index("microphone"));
   }
@@ -830,8 +859,8 @@ TEST(CaptureRefreshTest, MicrophoneFailureStillRecordsTarget) {
   recording_audio_control_t control;
   control.fail_microphone = true;
   std::mutex mutex;
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
 
   {
@@ -858,8 +887,8 @@ TEST(CaptureRefreshTest, RetargetDuringCreationDiscardsAndRetries) {
   recording_audio_control_t control;
   control.retarget_once = true;
   std::mutex mutex;
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
   session_capture_target_t target {control, platf::audio_capture_intent_e::host_and_client, mutex};
 
@@ -925,8 +954,8 @@ TEST(CaptureReleaseTest, SkipsClearWhenNothingRecorded) {
 TEST(CaptureReleaseTest, ClearsRecordedTarget) {
   recording_audio_control_t control;
   std::mutex mutex;
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
 
   {
@@ -954,8 +983,8 @@ TEST(CaptureOrchestrationTest, StartupSequenceRunsDispatchRefreshCreateAndReleas
   for (const auto &routing : {make_capture_routing(), make_swap_routing()}) {
     recording_audio_control_t control;
     std::mutex mutex;
-    const std::function<std::uint32_t()> provider = [] {
-      return 1234u;
+    const std::function<platf::process_identity_t()> provider = [] {
+      return platf::process_identity_t {1234u, 91011u};
     };
     audio_ctx_t ctx {};
 
@@ -1038,10 +1067,10 @@ namespace {
     /**
      * @brief Record the refreshed capture target in the shared base record.
      * @param intent Capture intent resolved from the audio configuration.
-     * @param process_id Operating-system PID to capture, or 0 for endpoint capture.
+     * @param identity Operating-system identity to capture, or {0, 0} for endpoint capture.
      */
-    void set_capture_target(platf::audio_capture_intent_e intent, std::uint32_t process_id) override {
-      record_capture_target(intent, process_id);
+    void set_capture_target(platf::audio_capture_intent_e intent, platf::process_identity_t identity) override {
+      record_capture_target(intent, identity.process_id);
     }
 
     /**
@@ -1183,10 +1212,10 @@ TEST(BaseRecordTest, CaptureTargetRecordMatchesIntentAndPid) {
  */
 TEST(BaseRecordTest, CaptureTargetSetterStoresIntentAndPid) {
   recorded_audio_control_t control;
-  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, 1234);
+  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, platf::process_identity_t {1234, 0});
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, platf::audio_capture_intent_e::host_and_client);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 1234u);
-  control.set_capture_target(platf::audio_capture_intent_e::client_only, 0);
+  control.set_capture_target(platf::audio_capture_intent_e::client_only, platf::process_identity_t {0, 0});
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, platf::audio_capture_intent_e::client_only);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 0u);
 }
@@ -1200,7 +1229,7 @@ TEST(BaseRecordTest, CaptureTargetSetterStoresIntentAndPid) {
 TEST(BaseRecordTest, ConditionalClearResetsMatchingTarget) {
   using intent = platf::audio_capture_intent_e;
   recorded_audio_control_t control;
-  control.set_capture_target(intent::host_and_client, 1234);
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {1234, 0});
   control.clear_capture_target(intent::host_and_client, 1234);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::client_only);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 0u);
@@ -1215,7 +1244,7 @@ TEST(BaseRecordTest, ConditionalClearResetsMatchingTarget) {
 TEST(BaseRecordTest, ConditionalClearPreservesMismatchedTarget) {
   using intent = platf::audio_capture_intent_e;
   recorded_audio_control_t control;
-  control.set_capture_target(intent::host_and_client, 1234);
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {1234, 0});
   // A survivor that recorded a different PID keeps its target.
   control.clear_capture_target(intent::host_and_client, 5678);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::host_and_client);
@@ -1227,7 +1256,7 @@ TEST(BaseRecordTest, ConditionalClearPreservesMismatchedTarget) {
   // An endpoint clear cannot wipe a process target and vice versa.
   control.clear_capture_target(intent::host_and_client, 0);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 1234u);
-  control.set_capture_target(intent::client_only, 0);
+  control.set_capture_target(intent::client_only, platf::process_identity_t {0, 0});
   control.clear_capture_target(intent::host_and_client, 1234);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::client_only);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 0u);
@@ -1243,8 +1272,8 @@ TEST(BaseRecordTest, ConditionalClearPreservesMismatchedTarget) {
 TEST(BaseRecordTest, ExitingSessionPreservesSurvivorTarget) {
   using intent = platf::audio_capture_intent_e;
   recorded_audio_control_t control;
-  control.set_capture_target(intent::host_and_client, 1111);
-  control.set_capture_target(intent::host_and_client, 2222);
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {1111, 0});
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {2222, 0});
   control.clear_capture_target(intent::host_and_client, 1111);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::host_and_client);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 2222u);
@@ -1279,7 +1308,7 @@ TEST(BaseRecordTest, ConcurrentControlAccessStaysConsistent) {
       if (control.snapshot_recorded_sink().compare(0, 5, "sink-") != 0) {
         consistent.store(false, std::memory_order_relaxed);
       }
-      control.set_capture_target(host_and_client, pid);
+      control.set_capture_target(host_and_client, platf::process_identity_t {pid, 0});
       const auto target = control.snapshot_recorded_capture_target();
       const bool valid_target = (target.intent == host_and_client && target.process_id >= 1 && target.process_id <= 4) ||
                                 (target.intent == client_only && target.process_id == 0);
@@ -1310,7 +1339,7 @@ TEST(BaseRecordTest, ConcurrentControlAccessStaysConsistent) {
 TEST(BaseRecordTest, MacOsLikeNoOpLeavesRecordUntouched) {
   macos_like_audio_control_t control;
   EXPECT_EQ(control.capture_sink("any-sink"), 0);
-  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, 1234);
+  control.set_capture_target(platf::audio_capture_intent_e::host_and_client, platf::process_identity_t {1234, 999});
   control.clear_capture_target(platf::audio_capture_intent_e::host_and_client, 1234);
   EXPECT_TRUE(control.snapshot_recorded_sink().empty());
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, platf::audio_capture_intent_e::client_only);
@@ -1327,8 +1356,8 @@ TEST(BaseRecordTest, MacOsLikeNoOpLeavesRecordUntouched) {
 TEST(BaseRecordTest, SessionGuardReleasesRealBaseRecord) {
   recorded_audio_control_t control;
   std::mutex mutex;
-  const std::function<std::uint32_t()> provider = [] {
-    return 1234u;
+  const std::function<platf::process_identity_t()> provider = [] {
+    return platf::process_identity_t {1234u, 91011u};
   };
 
   {
@@ -1370,13 +1399,13 @@ public:
    * hold, mirroring the production Windows setter, so the stub never exposes a
    * split write.
    * @param intent Capture intent resolved from the audio configuration.
-   * @param process_id Operating-system PID to capture, or 0 for endpoint capture.
+   * @param identity Operating-system identity to capture, or {0, 0} for endpoint capture.
    */
-  void set_capture_target(platf::audio_capture_intent_e intent, std::uint32_t process_id) override {
+  void set_capture_target(platf::audio_capture_intent_e intent, platf::process_identity_t identity) override {
     std::lock_guard lock {capture_state_mutex_};
     recorded_target_.intent = intent;
-    recorded_target_.process_id = process_id;
-    paired_identity = process_id;
+    recorded_target_.process_id = identity.process_id;
+    paired_identity = identity.process_id;
   }
 
   /**
@@ -1446,7 +1475,7 @@ TEST(BaseRecordTest, KeepDefaultHelperRecordsAndReturnsZero) {
 TEST(BaseRecordTest, ClearMatchResetsTripleAndFiresHook) {
   using intent = platf::audio_capture_intent_e;
   hook_audio_control_t control;
-  control.set_capture_target(intent::host_and_client, 1234);
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {1234, 0});
   EXPECT_EQ(control.paired_identity, 1234u);
   control.clear_capture_target(intent::host_and_client, 1234);
   EXPECT_TRUE(control.hook_fired);
@@ -1465,7 +1494,7 @@ TEST(BaseRecordTest, ClearMatchResetsTripleAndFiresHook) {
 TEST(BaseRecordTest, ClearMismatchPreservesTripleAndSkipsHook) {
   using intent = platf::audio_capture_intent_e;
   hook_audio_control_t control;
-  control.set_capture_target(intent::host_and_client, 1234);
+  control.set_capture_target(intent::host_and_client, platf::process_identity_t {1234, 0});
   control.clear_capture_target(intent::host_and_client, 5678);
   EXPECT_FALSE(control.hook_fired);
   EXPECT_EQ(control.snapshot_recorded_capture_target().process_id, 1234u);
@@ -1474,7 +1503,7 @@ TEST(BaseRecordTest, ClearMismatchPreservesTripleAndSkipsHook) {
   EXPECT_FALSE(control.hook_fired);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::host_and_client);
   EXPECT_EQ(control.paired_identity, 1234u);
-  control.set_capture_target(intent::client_only, 0);
+  control.set_capture_target(intent::client_only, platf::process_identity_t {0, 0});
   control.clear_capture_target(intent::host_and_client, 1234);
   EXPECT_FALSE(control.hook_fired);
   EXPECT_EQ(control.snapshot_recorded_capture_target().intent, intent::client_only);

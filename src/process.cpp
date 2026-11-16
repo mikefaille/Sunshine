@@ -415,11 +415,37 @@ namespace proc {
   }
 
   std::uint32_t proc_t::app_process_id() {
+    return app_process_identity().process_id;
+  }
+
+  /**
+   * @brief Return the operating-system identity of the launched application root process.
+   */
+  platf::process_identity_t proc_t::app_process_identity() {
     std::lock_guard lock {proc_lifecycle_mutex()};
     if (placebo || !_process.valid() || !_process.running()) {
-      return 0u;
+      return {};
     }
-    return static_cast<std::uint32_t>(_process.id());
+#ifdef _WIN32
+    // Query the creation marker from the owned child handle while the lock pins
+    // it to the launched process: even if the PID is reused later, the recorded
+    // baseline still names this process, so revalidation rejects the replacement.
+    FILETIME creation_time {};
+    FILETIME exit_time {};
+    FILETIME kernel_time {};
+    FILETIME user_time {};
+    if (!GetProcessTimes(_process.native_handle(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+      return {};
+    }
+    const auto combined_creation_time = (static_cast<std::uint64_t>(creation_time.dwHighDateTime) << 32) | static_cast<std::uint64_t>(creation_time.dwLowDateTime);
+    if (combined_creation_time == 0) {
+      return {};
+    }
+    return {static_cast<std::uint32_t>(_process.id()), combined_creation_time};
+#else
+    // POSIX backends never select per-process capture, so no creation marker is needed.
+    return {static_cast<std::uint32_t>(_process.id()), 0};
+#endif
   }
 
   int proc_t::running() {
@@ -581,9 +607,9 @@ namespace proc {
     finish_termination(std::move(*claimed));
   }
 
-  std::function<std::uint32_t()> app_process_id_provider(proc_t &target) {
+  std::function<platf::process_identity_t()> app_process_identity_provider(proc_t &target) {
     return [&target]() {
-      return target.app_process_id();
+      return target.app_process_identity();
     };
   }
 

@@ -382,17 +382,10 @@ namespace platf::audio {
     return intent == host_and_client && process_id != 0;
   }
 
-  /**
-   * @brief Identity of a process-loopback capture target.
-   *
-   * A PID alone can be reused after the original process exits. Pairing it
-   * with the process creation time distinguishes the recorded process from a
-   * later process that happens to receive the same PID.
-   */
-  struct process_identity_t {
-    std::uint32_t process_id {};  ///< Operating-system PID, or 0 when no identity was recorded.
-    std::uint64_t creation_time {};  ///< Process creation time as a combined FILETIME value, or 0 when unavailable.
-  };
+  // Process identities use the shared platf::process_identity_t: the PID and
+  // creation marker arrive as one handed-off bundle from the owned child
+  // handle, so this backend stores the baseline verbatim instead of querying
+  // it by PID (see platf::process_identity_t).
 
   /**
    * @brief Whether a current process identity is the recorded capture target.
@@ -1605,24 +1598,24 @@ namespace platf::audio {
      *
      * Thread-safe: the intent, PID, and identity are stored as one snapshot
      * under `capture_state_mutex_`, so microphone() never sees a mismatched
-     * pair. The process identity is queried before locking; only the store is
-     * guarded.
+     * triple. The identity arrives pre-queried from the owned child handle
+     * under the process lifecycle lock and is stored verbatim as the
+     * revalidation baseline: querying it here by PID instead would reopen the
+     * reuse window the handoff closes (an exited process whose PID was already
+     * reused would record the replacement's creation time and defeat both the
+     * pre-activation and post-activation checks). An unverifiable baseline
+     * fails closed at validation time, where the PID resolves to endpoint capture.
      *
      * @param intent Capture intent resolved from the audio configuration.
-     * @param process_id Operating-system PID to capture, or 0 for endpoint capture.
+     * @param identity Operating-system identity to capture, or {0, 0} for endpoint capture.
      */
-    void set_capture_target(audio_capture_intent_e intent, std::uint32_t process_id) override {
-      process_identity_t identity {};
-      if (process_id != 0) {
-        if (const auto queried = query_process_identity(process_id)) {
-          identity = *queried;
-        } else {
-          BOOST_LOG(debug) << "Cannot record a verifiable identity for capture target process ["sv << process_id << "]; endpoint capture will be used"sv;
-        }
+    void set_capture_target(audio_capture_intent_e intent, process_identity_t identity) override {
+      if (identity.process_id == 0) {
+        identity = {};
       }
       std::lock_guard lock {capture_state_mutex_};
       recorded_target_.intent = intent;
-      recorded_target_.process_id = process_id;
+      recorded_target_.process_id = identity.process_id;
       capture_target_identity = identity;
     }
 
@@ -3029,12 +3022,30 @@ namespace platf::audio {
     /**
      * @brief Record a capture PID through the production setter.
      * @param process_id PID to record.
+     * @param creation_time Creation marker to record with the PID.
      * @return PID stored on the control.
      */
-    std::uint32_t recorded_capture_process_id(std::uint32_t process_id) {
+    std::uint32_t recorded_capture_process_id(std::uint32_t process_id, std::uint64_t creation_time) {
       audio_control_t control;
-      control.set_capture_target(audio_capture_intent_e::host_and_client, process_id);
+      control.set_capture_target(audio_capture_intent_e::host_and_client, process_identity_t {process_id, creation_time});
       return control.snapshot_capture_target().process_id;
+    }
+
+    /**
+     * @brief Record a capture identity through the production setter.
+     *
+     * The baseline is stored verbatim without a PID query, so even a
+     * fabricated identity for a nonexistent PID round-trips unchanged; only
+     * validation resolves it to endpoint capture.
+     *
+     * @param process_id PID to record.
+     * @param creation_time Creation marker to record with the PID.
+     * @return Creation marker stored on the control.
+     */
+    std::uint64_t recorded_capture_creation_time(std::uint32_t process_id, std::uint64_t creation_time) {
+      audio_control_t control;
+      control.set_capture_target(audio_capture_intent_e::host_and_client, process_identity_t {process_id, creation_time});
+      return control.snapshot_capture_target().identity.creation_time;
     }
 
     /**
@@ -3075,11 +3086,12 @@ namespace platf::audio {
     /**
      * @brief Exercise recorded-target validation through the production control.
      * @param process_id PID to record and immediately revalidate.
+     * @param creation_time Creation marker recorded as the validation baseline.
      * @return PID accepted for process loopback, or 0 for endpoint capture.
      */
-    std::uint32_t validated_capture_target_for_pid(std::uint32_t process_id) {
+    std::uint32_t validated_capture_target_for_pid(std::uint32_t process_id, std::uint64_t creation_time) {
       audio_control_t control;
-      control.set_capture_target(audio_capture_intent_e::host_and_client, process_id);
+      control.set_capture_target(audio_capture_intent_e::host_and_client, process_identity_t {process_id, creation_time});
       return control.validated_capture_process_id();
     }
 
@@ -3104,7 +3116,8 @@ namespace platf::audio {
      */
     audio_capture_intent_e intent_after_conditional_clear(audio_capture_intent_e set_intent, std::uint32_t set_pid, audio_capture_intent_e clear_intent, std::uint32_t clear_pid) {
       audio_control_t control;
-      control.set_capture_target(set_intent, set_pid);
+      // The clear contract matches on intent and PID only; the marker is unverifiable here by design.
+      control.set_capture_target(set_intent, process_identity_t {set_pid, 0});
       control.clear_capture_target(clear_intent, clear_pid);
       return control.snapshot_capture_target().intent;
     }
@@ -3120,7 +3133,8 @@ namespace platf::audio {
      */
     std::uint32_t pid_after_conditional_clear(audio_capture_intent_e set_intent, std::uint32_t set_pid, audio_capture_intent_e clear_intent, std::uint32_t clear_pid) {
       audio_control_t control;
-      control.set_capture_target(set_intent, set_pid);
+      // The clear contract matches on intent and PID only; the marker is unverifiable here by design.
+      control.set_capture_target(set_intent, process_identity_t {set_pid, 0});
       control.clear_capture_target(clear_intent, clear_pid);
       return control.snapshot_capture_target().process_id;
     }
@@ -3128,8 +3142,8 @@ namespace platf::audio {
     /**
      * @brief Record this process as the capture target, conditionally clear it, and report the stored identity.
      *
-     * The current process PID is the deterministic verifiable target: its
-     * creation-time identity query always succeeds on the test host, so the
+     * The current process is the deterministic verifiable target: its PID and
+     * creation time are read directly from the owned process handle, so the
      * recorded identity is nonzero until `on_capture_target_cleared()` runs.
      *
      * @param matching_clear Whether the clear uses the recorded intent and PID.
@@ -3138,7 +3152,15 @@ namespace platf::audio {
     std::uint64_t identity_creation_time_after_conditional_clear(bool matching_clear) {
       audio_control_t control;
       const auto process_id = static_cast<std::uint32_t>(GetCurrentProcessId());
-      control.set_capture_target(audio_capture_intent_e::host_and_client, process_id);
+      FILETIME creation_time {};
+      FILETIME exit_time {};
+      FILETIME kernel_time {};
+      FILETIME user_time {};
+      std::uint64_t combined_creation_time = 0;
+      if (GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+        combined_creation_time = (static_cast<std::uint64_t>(creation_time.dwHighDateTime) << 32) | static_cast<std::uint64_t>(creation_time.dwLowDateTime);
+      }
+      control.set_capture_target(audio_capture_intent_e::host_and_client, process_identity_t {process_id, combined_creation_time});
       control.clear_capture_target(audio_capture_intent_e::host_and_client, matching_clear ? process_id : process_id + 1);
       return control.snapshot_capture_target().identity.creation_time;
     }
@@ -3178,7 +3200,7 @@ namespace platf::audio {
           if (control.snapshot_assigned_sink().compare(0, 5, "sink-") != 0) {
             consistent.store(false, std::memory_order_relaxed);
           }
-          control.set_capture_target(host_and_client, pid);
+          control.set_capture_target(host_and_client, process_identity_t {pid, pid});
           const auto target = control.snapshot_capture_target();
           const bool valid_target = (target.intent == host_and_client && target.process_id >= 1 && target.process_id <= 4) ||
                                     (target.intent == client_only && target.process_id == 0);
@@ -3329,11 +3351,12 @@ namespace platf::audio {
      * microphone() via the parameter-bundle overload. A valid target proves
      * the loopback-attempt branch ran when the activator was invoked; the
      * failing activator then proves the activation-failure fallback by
-     * resolving the endpoint path afterwards. The current process PID is the
-     * deterministic valid target: its identity query always succeeds on the
-     * test host, while PID 0 or a mismatched intent must never attempt loopback.
+     * resolving the endpoint path afterwards. The current process identity is
+     * the deterministic valid target: its PID and creation time are read from
+     * the owned handle, while PID 0, an unverifiable marker, a mismatched
+     * marker, or a mismatched intent must never attempt loopback.
      *
-     * @param probe Capture probe: sinks, intent, PID, enumerator, and keep-default flag in; attempt evidence out.
+     * @param probe Capture probe: sinks, intent, identity, enumerator, and keep-default flag in; attempt evidence out.
      * @return True when process-loopback activation was attempted.
      */
     bool microphone_attempts_loopback_for_target(microphone_loopback_probe_t &probe) {
@@ -3341,7 +3364,7 @@ namespace platf::audio {
       probe.device_enum->AddRef();
       control.device_enum.reset(probe.device_enum);
       control.capture_sink(probe.assigned_sink);
-      control.set_capture_target(probe.intent, probe.process_id);
+      control.set_capture_target(probe.intent, process_identity_t {probe.process_id, probe.creation_time});
       control.set_test_loopback_activator([&probe](std::uint32_t attempted_pid, const format_t &) -> audio_client_t {
         probe.attempted_process_id = attempted_pid;
         return nullptr;

@@ -930,13 +930,37 @@ namespace platf {
   };
 
   /**
+   * @brief Operating-system identity of a launched process for capture routing.
+   *
+   * A PID alone can be reused after the original process exits. Pairing it with
+   * an OS creation marker distinguishes the recorded process from a later
+   * process that happens to receive the same PID. The marker is opaque:
+   * backends must only compare it for equality, never interpret it. A zero
+   * marker means the identity is unverifiable (no process, or the platform
+   * cannot query creation markers); backends must fail closed to endpoint
+   * capture in that case.
+   *
+   * The identity is captured from the owned child handle under the process
+   * lifecycle lock and carried through the audio handoff as one bundle, so the
+   * baseline always names the launched process even if its PID is later
+   * reused. Backends must store the handed-off marker verbatim as their
+   * revalidation baseline instead of querying it by PID, which would reopen
+   * the reuse window the handoff closes.
+   */
+  struct process_identity_t {
+    std::uint32_t process_id {};  ///< Operating-system PID, or 0 for endpoint capture.
+    std::uint64_t creation_time {};  ///< Opaque OS creation marker, or 0 when unverifiable.
+  };
+
+  /**
    * @brief Recorded per-process capture target shared by audio backends.
    *
    * Windows and Linux record the sink selected at startup so microphone() can
    * consume it later; Windows additionally records the intent and PID for
    * process-loopback capture. The record carries at most the intent and the
-   * PID: process identity queries and revalidation stay backend-side because
-   * they depend on WASAPI-only process APIs.
+   * PID: the creation marker travels with set_capture_target() but its storage,
+   * identity queries, and revalidation stay backend-side because they depend on
+   * WASAPI-only process APIs.
    */
   struct capture_target_record_t {
     audio_capture_intent_e intent {audio_capture_intent_e::client_only};  ///< Intent for the next microphone() call.
@@ -1009,13 +1033,15 @@ namespace platf {
      *
      * The default implementation is a no-op so backends without per-process
      * capture are unchanged. Backends that support process loopback override
-     * this to store the intent and PID together, so microphone() never sees
+     * this to store the intent and identity together, so microphone() never sees
      * a mismatched pair. A PID of 0 selects ordinary endpoint or sink capture.
+     * The creation marker arrives pre-queried from the owned child handle and
+     * must be stored verbatim as the revalidation baseline.
      *
      * @param intent Capture intent resolved from the audio configuration.
-     * @param process_id Operating-system PID to capture, or 0 for endpoint capture.
+     * @param identity Operating-system identity to capture, or {0, 0} for endpoint capture.
      */
-    virtual void set_capture_target([[maybe_unused]] audio_capture_intent_e intent, [[maybe_unused]] std::uint32_t process_id) {
+    virtual void set_capture_target([[maybe_unused]] audio_capture_intent_e intent, [[maybe_unused]] process_identity_t identity) {
       // Intentionally empty: backends without per-process capture inherit this no-op.
     }
 

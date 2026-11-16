@@ -216,7 +216,7 @@ namespace audio {
    */
   std::unique_ptr<platf::mic_t> session_capture_target_t::create_microphone(
     bool process_capture_supported,
-    const std::function<std::uint32_t()> &capture_process_id_provider,
+    const std::function<platf::process_identity_t()> &capture_process_identity_provider,
     const platf::microphone_params_t &mic_params
   ) {
     // Refresh the capture target before every microphone creation so a
@@ -230,11 +230,15 @@ namespace audio {
     // the target is discarded and creation retries once with a fresh
     // refresh, preserving the original refresh/microphone pairing.
     for (int attempt = 0; attempt < 2; ++attempt) {
-      const auto process_id = capture_process_id_provider ? capture_process_id_provider() : 0u;
+      const auto identity = capture_process_identity_provider ? capture_process_identity_provider() : platf::process_identity_t {};
+      // Gate the whole bundle, not just the PID: the handed-off creation
+      // marker is the backend's revalidation baseline, and a marker paired
+      // with a zeroed PID would name no process at all.
+      const auto effective_identity = should_capture_process_tree(intent_, process_capture_supported, identity.process_id) ? identity : platf::process_identity_t {};
       {
         std::lock_guard lock {*mutex_};
-        process_id_ = should_capture_process_tree(intent_, process_capture_supported, process_id) ? process_id : 0u;
-        control_->set_capture_target(intent_, process_id_);
+        process_id_ = effective_identity.process_id;
+        control_->set_capture_target(intent_, effective_identity);
         recorded_ = true;
       }
       auto mic = control_->microphone(mic_params);
@@ -261,7 +265,7 @@ namespace audio {
    * releases the shared target only when it still holds this session's intent
    * and PID.
    */
-  void capture(safe::mail_t mail, config_t config, stream::session_t *channel_data, std::function<std::uint32_t()> capture_process_id_provider) {
+  void capture(safe::mail_t mail, config_t config, stream::session_t *channel_data, std::function<platf::process_identity_t()> capture_process_identity_provider) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     if (!config::audio.stream) {
       shutdown_event->view();
@@ -337,7 +341,7 @@ namespace audio {
       continuous_audio,
       host_audio
     };
-    auto mic = capture_target.create_microphone(process_capture_supported, capture_process_id_provider, mic_params);
+    auto mic = capture_target.create_microphone(process_capture_supported, capture_process_identity_provider, mic_params);
     if (!mic) {
       return;
     }
@@ -374,7 +378,7 @@ namespace audio {
           BOOST_LOG(info) << "Reinitializing audio capture"sv;
           mic.reset();
           do {
-            mic = capture_target.create_microphone(process_capture_supported, capture_process_id_provider, mic_params);
+            mic = capture_target.create_microphone(process_capture_supported, capture_process_identity_provider, mic_params);
             if (!mic) {
               BOOST_LOG(warning) << "Couldn't re-initialize audio input"sv;
             }

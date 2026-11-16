@@ -706,11 +706,11 @@ TEST(ProcessTest, AppProcessIdTracksRealChildLifecycle) {
 /**
  * @brief Verify the provider handed to audio capture tracks the launched app.
  *
- * `stream.cpp` passes `proc::app_process_id_provider(proc::proc)` to
+ * `stream.cpp` passes `proc::app_process_identity_provider(proc::proc)` to
  * `audio::capture()`; this pins that the provider reports the live child
- * PID and falls back to 0 after termination.
+ * identity and falls back to {0, 0} after termination.
  */
-TEST(ProcessTest, AppProcessIdProviderTracksRealChildLifecycle) {
+TEST(ProcessTest, AppProcessIdentityProviderTracksRealChildLifecycle) {
   boost::process::v1::environment env = boost::this_process::environment();
   proc::ctx_t ctx {};
   ctx.name = "Sleeper";
@@ -719,16 +719,25 @@ TEST(ProcessTest, AppProcessIdProviderTracksRealChildLifecycle) {
   std::vector<proc::ctx_t> apps;
   apps.push_back(std::move(ctx));
   proc::proc_t target(std::move(env), std::move(apps));
-  const auto provider = proc::app_process_id_provider(target);
+  const auto provider = proc::app_process_identity_provider(target);
 
-  EXPECT_EQ(provider(), 0u);
+  EXPECT_EQ(provider().process_id, 0u);
+  EXPECT_EQ(provider().creation_time, 0u);
   auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
   ASSERT_EQ(target.execute(7, launch_session), 0);
-  EXPECT_NE(provider(), 0u);
-  EXPECT_EQ(provider(), target.app_process_id());
+  EXPECT_NE(provider().process_id, 0u);
+  #ifdef _WIN32
+  // The marker is queried from the owned child handle, so it is verifiable for a live child.
+  EXPECT_NE(provider().creation_time, 0u);
+  #else
+  // POSIX backends never select per-process capture, so no marker is reported.
+  EXPECT_EQ(provider().creation_time, 0u);
+  #endif
+  EXPECT_EQ(provider().process_id, target.app_process_id());
 
   target.terminate();
-  EXPECT_EQ(provider(), 0u);
+  EXPECT_EQ(provider().process_id, 0u);
+  EXPECT_EQ(provider().creation_time, 0u);
 }
 
 /**

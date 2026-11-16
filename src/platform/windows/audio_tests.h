@@ -32,6 +32,7 @@ namespace platf::audio::tests {
     std::string configured_sink;  ///< Sink configured by the user, possibly empty.
     platf::audio_capture_intent_e intent {platf::audio_capture_intent_e::client_only};  ///< Capture intent recorded for the next microphone() call.
     std::uint32_t process_id {};  ///< PID recorded for the next microphone() call, or 0 for endpoint capture.
+    std::uint64_t creation_time {};  ///< Creation marker recorded with the PID, or 0 for an unverifiable baseline.
     IMMDeviceEnumerator *device_enum {};  ///< Device enumerator supplied by the test.
     bool keep_default {};  ///< keep_default_sink value tested with.
     std::uint32_t attempted_process_id {};  ///< Receives the PID passed to the activator, or 0 when loopback was never attempted.
@@ -46,11 +47,12 @@ namespace platf::audio::tests {
    * microphone() via the parameter-bundle overload. A valid target proves
    * the loopback-attempt branch ran when the activator was invoked; the
    * failing activator then proves the activation-failure fallback by
-   * resolving the endpoint path afterwards. The current process PID is the
-   * deterministic valid target: its identity query always succeeds on the
-   * test host, while PID 0 or a mismatched intent must never attempt loopback.
+   * resolving the endpoint path afterwards. The current process identity is
+   * the deterministic valid target: its PID and creation time are read from
+   * the owned handle, while PID 0, an unverifiable marker, a mismatched
+   * marker, or a mismatched intent must never attempt loopback.
    *
-   * @param probe Capture probe: sinks, intent, PID, enumerator, and keep-default flag in; attempt evidence out.
+   * @param probe Capture probe: sinks, intent, identity, enumerator, and keep-default flag in; attempt evidence out.
    * @return True when process-loopback activation was attempted.
    */
   bool microphone_attempts_loopback_for_target(microphone_loopback_probe_t &probe);

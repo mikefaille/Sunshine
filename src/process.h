@@ -124,11 +124,27 @@ namespace proc {
      *
      * Returns 0 for the Desktop/placebo session, when no application has been
      * launched, and when the root process is no longer running. Callers use 0
-     * to fall back to ordinary endpoint audio capture.
+     * to fall back to ordinary endpoint audio capture. Implemented via
+     * app_process_identity() so the PID always agrees with the handed-off identity.
      *
      * @return Launched root process PID, or 0 when unavailable.
      */
     std::uint32_t app_process_id();
+
+    /**
+     * @brief Return the operating-system identity of the launched application root process.
+     *
+     * The PID and creation marker are captured together from the owned child
+     * handle under the lifecycle lock, so the pair always names the launched
+     * process even if its PID is later reused. Returns {0, 0} for the
+     * Desktop/placebo session, when no application has been launched, when the
+     * root process is no longer running, and when the creation marker cannot
+     * be queried. Callers use a zero PID to fall back to ordinary endpoint
+     * audio capture.
+     *
+     * @return Launched root process identity, or {0, 0} when unavailable.
+     */
+    platf::process_identity_t app_process_identity();
 
     ~proc_t();
 
@@ -333,14 +349,14 @@ namespace proc {
   extern proc_t proc;
 
   /**
-   * @brief Build the capture process-id provider handed to audio capture.
+   * @brief Build the capture process-identity provider handed to audio capture.
    *
-   * The returned callable reports `target.app_process_id()` at each call, so
+   * The returned callable reports `target.app_process_identity()` at each call, so
    * audio (re)initialization always sees the currently launched app. It
    * borrows `target`; the caller keeps it alive for the provider's lifetime.
    *
-   * @param target Process manager whose launched app PID is reported.
-   * @return Provider returning the launched root PID, or 0 when unavailable.
+   * @param target Process manager whose launched app identity is reported.
+   * @return Provider returning the launched root identity, or {0, 0} when unavailable.
    */
-  std::function<std::uint32_t()> app_process_id_provider(proc_t &target);
+  std::function<platf::process_identity_t()> app_process_identity_provider(proc_t &target);
 }  // namespace proc

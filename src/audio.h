@@ -321,13 +321,13 @@ namespace audio {
      * microphone is discarded and creation retries once.
      *
      * @param process_capture_supported Whether the backend captures a process tree.
-     * @param capture_process_id_provider Optional callable returning the launched application PID (0 for endpoint capture).
+     * @param capture_process_identity_provider Optional callable returning the launched application identity ({0, 0} for endpoint capture).
      * @param mic_params Microphone capture parameters for the requested layout.
      * @return Microphone capture object, or nullptr when creation failed.
      */
     [[nodiscard]] std::unique_ptr<platf::mic_t> create_microphone(
       bool process_capture_supported,
-      const std::function<std::uint32_t()> &capture_process_id_provider,
+      const std::function<platf::process_identity_t()> &capture_process_identity_provider,
       const platf::microphone_params_t &mic_params
     );
 
@@ -382,9 +382,9 @@ namespace audio {
    * @param mail Mailbox used to publish encoded audio packets.
    * @param config Audio capture and encoder settings.
    * @param channel_data Stream session that receives the encoded packets.
-   * @param capture_process_id_provider Optional callable returning the launched application PID (0 for endpoint capture).
+   * @param capture_process_identity_provider Optional callable returning the launched application identity ({0, 0} for endpoint capture).
    */
-  void capture(safe::mail_t mail, config_t config, stream::session_t *channel_data, std::function<std::uint32_t()> capture_process_id_provider = {});
+  void capture(safe::mail_t mail, config_t config, stream::session_t *channel_data, std::function<platf::process_identity_t()> capture_process_identity_provider = {});
 
   /**
    * @brief Get the reference to the audio context.
